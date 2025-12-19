@@ -1,3 +1,5 @@
+We have forked the VHAP repository and added our optimizations in this forked repository. 
+
 # VHAP: Versatile Head Alignment with Adaptive Appearance Priors
 
 <div align="center"> 
