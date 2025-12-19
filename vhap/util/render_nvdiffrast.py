@@ -14,43 +14,108 @@ import torch.nn.functional as F
 import torch
 import numpy as np
 from vhap.util import vector_ops as V
+import torch.cuda.nvtx as nvtx
 
+@torch.compile
+def _process_cluster_compiled(rgba_, c_mask, c_sample, w, c_rgba):
+    """Fused blending operation - compiled into single kernel"""
+    blended = c_sample * w + c_rgba * (1 - w)
+    rgba_.add_(c_mask * blended)
+    return rgba_
+
+
+# def get_SH_shading(normals, sh_coefficients, sh_const):
+#     """
+#     :param normals: shape N, H, W, K, 3
+#     :param sh_coefficients: shape N, 9, 3
+#     :return:
+#     """
+
+#     N = normals
+#     # compute sh basis function values of shape [N, H, W, K, 9]
+#     sh = torch.stack(
+#         [
+#             N[..., 0] * 0.0 + 1.0,
+#             N[..., 0],
+#             N[..., 1],
+#             N[..., 2],
+#             N[..., 0] * N[..., 1],
+#             N[..., 0] * N[..., 2],
+#             N[..., 1] * N[..., 2],
+#             N[..., 0] ** 2 - N[..., 1] ** 2,
+#             3 * (N[..., 2] ** 2) - 1,
+#         ],
+#         dim=-1,
+#     )
+#     sh = sh * sh_const[None, None, None, :].to(sh.device)
+
+#     # shape [N, H, W, K, 9, 1]
+#     sh = sh[..., None]
+
+#     # shape [N, H, W, K, 9, 3]
+#     sh_coefficients = sh_coefficients[:, None, None, :, :]
+
+#     # shape after linear combination [N, H, W, K, 3]
+#     shading = torch.sum(sh_coefficients * sh, dim=3)
+#     return shading
+
+
+
+
+
+
+# 1. Define the math logic in a helper function
+def sh_math_logic(normals, sh_coefficients, sh_const):
+    # Pre-multiply constants (The algorithmic fix)
+    # [1, 9, 3] * [1, 9, 1] -> [1, 9, 3]
+    coeffs = sh_coefficients * sh_const.view(1, 9, 1)
+    
+    # Extract components (No memory cost, just views)
+    nx = normals[..., 0]
+    ny = normals[..., 1]
+    nz = normals[..., 2]
+
+    # Hard-coded SH Basis math (No intermediate large tensors stored)
+    # The compiler will fuse these into a single block of math
+    sh0 = nx * 0.0 + 1.0
+    sh1 = nx
+    sh2 = ny
+    sh3 = nz
+    sh4 = nx * ny
+    sh5 = nx * nz
+    sh6 = ny * nz
+    sh7 = nx ** 2 - ny ** 2
+    sh8 = 3 * (nz ** 2) - 1
+    
+    # Manual stack-and-dot-product to avoid creating the large 'sh' tensor
+    # We essentially unroll the loop: sum(coeff[i] * basis[i])
+    # coeffs is [1, 9, 3] broadcasted to [B, H, W, 9, 3]
+    
+    # We access coeffs by index to prevent creating the [B,H,W,9,3] tensor
+    # coeffs[0, i] gets the i-th basis RGB vector [3]
+    res  = sh0.unsqueeze(-1) * coeffs[:, 0]
+    res += sh1.unsqueeze(-1) * coeffs[:, 1]
+    res += sh2.unsqueeze(-1) * coeffs[:, 2]
+    res += sh3.unsqueeze(-1) * coeffs[:, 3]
+    res += sh4.unsqueeze(-1) * coeffs[:, 4]
+    res += sh5.unsqueeze(-1) * coeffs[:, 5]
+    res += sh6.unsqueeze(-1) * coeffs[:, 6]
+    res += sh7.unsqueeze(-1) * coeffs[:, 7]
+    res += sh8.unsqueeze(-1) * coeffs[:, 8]
+
+    return res
+
+
+optimized_sh_logic = torch.compile(sh_math_logic, mode="reduce-overhead")
 
 def get_SH_shading(normals, sh_coefficients, sh_const):
-    """
-    :param normals: shape N, H, W, K, 3
-    :param sh_coefficients: shape N, 9, 3
-    :return:
-    """
+    if sh_const.device != sh_coefficients.device:
+        sh_const = sh_const.to(sh_coefficients.device)
 
-    N = normals
+    return optimized_sh_logic(normals, sh_coefficients, sh_const)
 
-    # compute sh basis function values of shape [N, H, W, K, 9]
-    sh = torch.stack(
-        [
-            N[..., 0] * 0.0 + 1.0,
-            N[..., 0],
-            N[..., 1],
-            N[..., 2],
-            N[..., 0] * N[..., 1],
-            N[..., 0] * N[..., 2],
-            N[..., 1] * N[..., 2],
-            N[..., 0] ** 2 - N[..., 1] ** 2,
-            3 * (N[..., 2] ** 2) - 1,
-        ],
-        dim=-1,
-    )
-    sh = sh * sh_const[None, None, None, :].to(sh.device)
 
-    # shape [N, H, W, K, 9, 1]
-    sh = sh[..., None]
 
-    # shape [N, H, W, K, 9, 3]
-    sh_coefficients = sh_coefficients[:, None, None, :, :]
-
-    # shape after linear combination [N, H, W, K, 3]
-    shading = torch.sum(sh_coefficients * sh, dim=3)
-    return shading
 
 
 class NVDiffRenderer(torch.nn.Module):
@@ -331,17 +396,25 @@ class NVDiffRenderer(torch.nn.Module):
     
     def shade(self, normal, lighting_coeff=None):
         if self.lighting_type == 'constant':
+            nvtx.range_push("SHADE - constant")
             diffuse = torch.ones_like(normal[..., :3])
+            nvtx.range_pop()
         elif self.lighting_type == 'front':
+            nvtx.range_push("SHADE - front")
             # diffuse = torch.clamp(V.dot(normal, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device='cuda')), 0.0, 1.0)
             diffuse = V.dot(normal, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device='cuda'))
             mask_backface = diffuse < 0
             diffuse[mask_backface] = diffuse[mask_backface].abs()*0.3
+            nvtx.range_pop()
         elif self.lighting_type == 'front-range':
+            nvtx.range_push("SHADE - front-range")
             bias = 0.75
             diffuse = torch.clamp(V.dot(normal, torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device='cuda')) + bias, 0.0, 1.0)
+            nvtx.range_pop()
         elif self.lighting_type == 'SH':
+            nvtx.range_push("SHADE - SH shading")
             diffuse = get_SH_shading(normal, lighting_coeff, self.sh_const)
+            nvtx.range_pop()
         else:
             raise NotImplementedError(f"Unknown lighting type: {self.lighting_type}")
         return diffuse
@@ -370,6 +443,7 @@ class NVDiffRenderer(torch.nn.Module):
 
         out_dict = {}
 
+        nvtx.range_push("compute v normals")
         # ---- vertex attributes ----
         if  self.lighting_space == 'world':
             v_normal = self.compute_v_normals(verts, faces)
@@ -384,7 +458,9 @@ class NVDiffRenderer(torch.nn.Module):
         attr, _ = dr.interpolate(v_attr, rast_out, faces)
         normal = attr[..., :3]
         normal = V.safe_normalize(normal)
+        nvtx.range_pop()
 
+        nvtx.range_push("uv space attributes")
         # ---- uv-space attributes ----
         texc, texd = dr.interpolate(verts_uv[None, ...], rast_out, faces_uv, rast_db=rast_out_db, diff_attrs='all')
         if align_texture_except_fid is not None:  # TODO: rethink when shading with normal
@@ -397,6 +473,10 @@ class NVDiffRenderer(torch.nn.Module):
 
         tex = tex.permute(0, 2, 3, 1).contiguous()  # (N, T, T, 4)
         albedo = dr.texture(tex, texc, texd, filter_mode='linear-mipmap-linear', max_mip_level=None)
+
+        nvtx.range_pop()
+
+        nvtx.range_push("shading")
         
         # ---- shading ----
         diffuse = self.shade(normal, lights)
@@ -405,6 +485,10 @@ class NVDiffRenderer(torch.nn.Module):
         rgb = albedo * diffuse
         alpha = fg_mask.float()
         rgba = torch.cat([rgb, alpha], dim=-1)
+
+        nvtx.range_pop()
+
+        nvtx.range_push("background")
 
         # ---- background ----
         if isinstance(background_color, list):
@@ -421,7 +505,13 @@ class NVDiffRenderer(torch.nn.Module):
         rgba = torch.where(fg_mask, rgba, rgba_bg)
         rgba_orig = rgba
 
+        nvtx.range_pop()
+
+        
+
         if enable_disturbance:
+
+            nvtx.range_push("color disturbance")
             # ---- color disturbance ----
             B, H, W, _ = rgba.shape
             # compute random blending weights based on the disturbance rate
@@ -433,6 +523,10 @@ class NVDiffRenderer(torch.nn.Module):
                 w_bg = (torch.rand_like(rgba[..., :1]) < self.disturb_rate_bg).int()
             else:
                 w_bg = torch.zeros_like(rgba[..., :1]).int()
+
+            nvtx.range_pop()
+
+            nvtx.range_push("sample pixels from clusters")
             
             # sample pixles from clusters
             fid = rast_out[..., -1:].long()  # the face index is shifted by +1
@@ -442,29 +536,55 @@ class NVDiffRenderer(torch.nn.Module):
             cid = torch.gather(fid2cid, -1, fid)
             out_dict['cid'] = cid.flip(1)
 
+            # Optimized cluster disturbance loop
             rgba_ = torch.zeros_like(rgba)
+
+            # Pre-allocate index buffer (reuse across iterations)
+            idx_buffer = torch.empty(B * H * W, dtype=torch.long, device=rgba.device)
+
             for i in range(num_clusters):
+                c_mask = (cid == i)  # Shape: (B, H, W, 1)
+                
+                # Handle cluster 1 separately (no sampling needed)
+                if i == 1:
+                    rgba_.add_(c_mask * rgba)
+                    continue
+                
+                # Select source and weight
                 c_rgba = rgba_bg if i == 0 else rgba
                 w = w_bg if i == 0 else w_fg
+                
+                # Optimized indexing: use expand instead of repeat_interleave (no memory copy)
+                c_mask_expanded = c_mask.expand(-1, -1, -1, 4)
+                c_pixels = c_rgba[c_mask_expanded].reshape(-1, 4).detach()
+                
+                # Skip empty clusters
+                n_pixels = c_pixels.shape[0]
+                if n_pixels == 0:
+                    continue
+                
+                # Random sampling with pre-allocated buffer
+                torch.randint(0, n_pixels, (B * H * W,), out=idx_buffer, device=c_pixels.device)
+                c_sample = c_pixels[idx_buffer].reshape(B, H, W, 4)
+                
+                # Compiled blending (fuses arithmetic + masking into single kernel)
+                rgba_ = _process_cluster_compiled(rgba_, c_mask, c_sample, w, c_rgba)
 
-                c_mask = cid == i
-                c_pixels = c_rgba[c_mask.repeat_interleave(4, dim=-1)].reshape(-1, 4).detach()  # NOTE: detach to avoid gradient flow
-
-                if i != 1:  # skip #1 indicate faces that are not in any cluster
-                    if len(c_pixels) > 0:
-                        c_idx = torch.randint(0, len(c_pixels), (B * H * W, ), device=c_pixels.device)
-                        c_sample = c_pixels[c_idx].reshape(B, H, W, 4)
-                        rgba_ += c_mask * (c_sample * w + c_rgba * (1 - w))
-                else:
-                    rgba_ += c_mask * c_rgba
             rgba = rgba_
 
+            nvtx.range_pop()
+
+
+        nvtx.range_push("AA")
+        
         # ---- AA on both RGB and alpha channels ----
         if align_boundary_except_vid is not None:
             verts_clip = self.detach_by_indices(verts_clip, align_boundary_except_vid)
         rgba_aa = dr.antialias(rgba, rast_out, verts_clip, faces.int())
         aa = ((rgba - rgba_aa) != 0).any(dim=-1, keepdim=True).repeat_interleave(4, dim=-1)
 
+        nvtx.range_pop()
+        
         # rgba_aa = torch.where(aa, rgba_aa, rgba_orig)  # keep the original color if not antialiased (commented out due to worse tracking performance)
         
         # ---- AA only on RGB channels ----

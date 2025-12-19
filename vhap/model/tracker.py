@@ -36,6 +36,7 @@ from collections import defaultdict
 from copy import deepcopy
 import time
 import os
+import torch.cuda.nvtx as nvtx
 
 
 class FlameTracker:
@@ -352,6 +353,7 @@ class FlameTracker:
         :return: the lmk loss for all 68 facial landmarks, a separate 2 pupil landmark loss and
                  a relative eye close term
         """
+        nvtx.range_push("lmk energy")
         img_size = sample["rgb"].shape[-2:]
 
         # ground-truth landmark
@@ -386,6 +388,7 @@ class FlameTracker:
             "pred_lmk2d": pred_lmk2d,
         }
 
+        nvtx.range_pop()
         return lmk_loss.mean(), result_dict
 
     def compute_photometric_energy(
@@ -405,12 +408,17 @@ class FlameTracker:
         :param albedos:
         :return:
         """
-        gt_rgb = sample["rgb"].to(verts)
+        nvtx.range_push("photometric energy")
+        nvtx.range_push("photometric energy - forward")
+        # gt_rgb = sample["rgb"].to(verts)
+        gt_rgb = sample["rgb"]
         if "alpha" in sample:
             gt_alpha = sample["alpha_map"].to(verts)
         else:
             gt_alpha = None
 
+        nvtx.range_push("photometric energy - forward - get flame fid, vid")
+        
         lights = self.lights[None] if self.lights is not None else None
         bg_color = self.get_background_color(gt_rgb, gt_alpha, stage)
 
@@ -420,6 +428,10 @@ class FlameTracker:
         align_boundary_except_vid = self.flame.mask.get_vid_by_region(
             self.cfg.pipeline[stage].align_boundary_except
         ) if stage is not None else None
+
+        nvtx.range_pop()
+
+        nvtx.range_push("photometric energy - forward - flame rendering")
 
         render_out = self.render_rgba(
             rast_dict, verts, faces, albedos, lights, bg_color, 
@@ -434,6 +446,11 @@ class FlameTracker:
 
         results_dict = render_out
 
+        nvtx.range_pop()
+
+        nvtx.range_pop()
+
+        nvtx.range_push("photometric energy - loss computation")
         # ---- rgb loss ----
         error_rgb = gt_rgb - pred_rgb
         color_loss = error_rgb.abs().sum() / pred_mask.detach().sum()
@@ -475,12 +492,15 @@ class FlameTracker:
         # photo_loss = color_loss + mask_loss
         photo_loss = color_loss
         # photo_loss = mask_loss
+        nvtx.range_pop()
+        nvtx.range_pop()
         return photo_loss, results_dict
     
     def compute_regularization_energy(self, result_dict, verts, verts_cano, lmks, albedos, timesteps, stage):
         """
         Computes the energy term that penalizes strong deviations from the flame base model
         """
+        nvtx.range_push("regularization energy")
         log_dict = {}
         
         std_tex = 1
@@ -602,6 +622,7 @@ class FlameTracker:
                     reg_offset_dynamic = ((offset_d - reg_offset_d) ** 2).mean()
                     log_dict["reg_offset_dynamic"] = self.cfg.w.reg_offset_dynamic * reg_offset_dynamic
 
+        nvtx.range_pop()
         return log_dict
 
     def scale_vertex_weights_by_region(self, weights, scale_factor, region):
@@ -701,6 +722,7 @@ class FlameTracker:
         frame energy
         :return: loss, log dict, predicted vertices and landmarks
         """
+        nvtx.range_push("total energy computation")
         log_dict = {}
 
         gt_rgb = sample["rgb"]
@@ -747,6 +769,7 @@ class FlameTracker:
         E_total = torch.stack([v for k, v in log_dict.items()]).sum()
         log_dict["total"] = E_total
 
+        nvtx.range_pop()
         return E_total, log_dict, verts, faces, lmks, albedos, result_dict
 
     @staticmethod
@@ -1353,7 +1376,8 @@ class GlobalTracker(FlameTracker):
             self.dataset, 
             batch_size=self.cfg.batch_size if not self.dataset.batchify_all_views else None, 
             shuffle=False, 
-            num_workers=4
+            num_workers=4,
+            pin_memory=True
         )
         for sample in dataloader:
             if sample["timestep_index"][0].item() == 0:
@@ -1419,6 +1443,10 @@ class GlobalTracker(FlameTracker):
         # compute loss and update parameters
         self.clear_cache()
 
+        for k, v in sample.items():
+            if isinstance(v, torch.Tensor):
+                sample[k] = v.to(self.device, non_blocking=True)
+
         self.fill_cam_params_into_sample(sample)
         (
             E_total,
@@ -1430,9 +1458,11 @@ class GlobalTracker(FlameTracker):
             output_dict,
         ) = self.compute_energy(sample, stage=stage,
         )
+        nvtx.range_push("backward pass")
         optimizer.zero_grad()
         E_total.backward()
         optimizer.step()
+        nvtx.range_pop()
 
         # log energy terms and visualize
         timestep = sample["timestep_index"][0]
